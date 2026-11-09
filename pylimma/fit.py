@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -56,6 +58,8 @@ class MArrayLM:
     ndups: int = 1
     spacing: int = 1
     treat_lfc: Optional[float] = None
+    lods: Optional[np.ndarray] = None
+    var_prior: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -181,8 +185,8 @@ def _duplicate_spot_correlation_matrix(narrays: int, ndups: int, correlation: fl
 
 
 def lm_fit(
-    M: np.ndarray | pd.DataFrame,
-    design: np.ndarray | pd.DataFrame,
+    M: np.ndarray | pd.DataFrame | EList,
+    design: np.ndarray | pd.DataFrame | None = None,
     weights: np.ndarray | pd.DataFrame | pd.Series | float | None = None,
     block: np.ndarray | pd.Series | list | None = None,
     correlation: float | None = None,
@@ -197,6 +201,13 @@ def lm_fit(
     least-squares fit is used for correlated samples.
     """
 
+    if isinstance(M, EList):
+        # lmFit(v, design) as in limma: expression, weights, design and names come from the EList
+        if weights is None:
+            weights = M.weights
+        if design is None:
+            design = M.design
+        M = pd.DataFrame(M.E, index=M.gene_names or None, columns=M.sample_names or None)
     y, gene_names, sample_names = _as_matrix(M, rows_prefix="gene_", cols_prefix="S")
     if isinstance(design, pd.DataFrame):
         x = design.to_numpy(dtype=float)
@@ -933,12 +944,18 @@ def _squeeze_var_robust_equal_df(
 
 def ebayes(
     fit: MArrayLM,
+    proportion: float = 0.01,
     stdev_coef_lim: tuple[float, float] = (0.1, 4.0),
     trend: bool | np.ndarray = False,
     robust: bool = False,
     winsor_tail_p: tuple[float, float] = (0.05, 0.1),
 ) -> MArrayLM:
-    """Run limma's empirical-Bayes moderated t calculation."""
+    """limma ``eBayes``: moderated t, F and the B-statistic (log-odds of differential expression).
+
+    As in limma, ``stdev_coef_lim`` only bounds the prior variance of the
+    coefficients used by the B-statistic; the moderated t uses the raw
+    ``stdev_unscaled``.
+    """
 
     s2 = np.asarray(fit.sigma, dtype=float) ** 2
     df = np.asarray(fit.df_residual, dtype=float)
@@ -954,7 +971,7 @@ def ebayes(
         winsor_tail_p=winsor_tail_p,
     )
 
-    su = np.clip(np.asarray(fit.stdev_unscaled, dtype=float), *stdev_coef_lim)
+    su = np.asarray(fit.stdev_unscaled, dtype=float)
     with np.errstate(divide="ignore", invalid="ignore"):
         t = fit.coefficients / (su * np.sqrt(s2_post)[:, None])
     p = 2.0 * stats.t.sf(np.abs(t), df_total[:, None])
@@ -968,7 +985,60 @@ def ebayes(
     f_stat, df1 = _classify_tests_f_stat(t, fit.cov_coefficients)
     fit.F = f_stat
     fit.F_p_value = stats.f.sf(f_stat, df1, df_total)
+    fit.var_prior, fit.lods = _ebayes_lods(t, su, df_total, d0, s20, proportion, stdev_coef_lim)
     return fit
+
+
+def _tmixture_vector(tstat, stdev_unscaled, df, proportion, v0_lim=None) -> float:
+    """limma tmixture.vector: prior variance of the non-null coefficients from the top t-statistics."""
+    ok = ~np.isnan(tstat)
+    tstat, stdev_unscaled, df = np.abs(tstat[ok]), stdev_unscaled[ok], np.asarray(df, dtype=float)[ok]
+    ngenes = tstat.size
+    ntarget = int(np.ceil(proportion / 2 * ngenes))
+    if ntarget < 1:
+        return np.nan
+    p = max(ntarget / ngenes, proportion)
+    max_df = df.max()
+    low = df < max_df
+    if low.any():   # put every t on the scale of the largest df (equal tail probability)
+        tstat = tstat.copy()
+        tail = stats.t.sf(tstat[low], df[low])
+        moved = stats.t.isf(tail, max_df)
+        # where the tail probability underflows, t is already far beyond every target quantile
+        tstat[low] = np.where(tail > 0, moved, tstat[low])
+    o = np.argsort(-tstat, kind="stable")[:ntarget]
+    tstat = tstat[o]
+    v1 = stdev_unscaled[o] ** 2
+    r = np.arange(1, ntarget + 1)
+    p0 = 2 * stats.t.sf(tstat, max_df)
+    ptarget = ((r - 0.5) / ngenes - (1 - p) * p0) / p
+    v0 = np.zeros(ntarget)
+    pos = ptarget > p0
+    if pos.any():
+        qtarget = stats.t.isf(ptarget[pos] / 2, max_df)
+        v0[pos] = v1[pos] * ((tstat[pos] / qtarget) ** 2 - 1)
+    if v0_lim is not None:
+        v0 = np.clip(v0, v0_lim[0], v0_lim[1])
+    return float(np.mean(v0))
+
+
+def _ebayes_lods(t, stdev_unscaled, df_total, df_prior, s2_prior, proportion, stdev_coef_lim):
+    """B-statistic of limma's .ebayes (log posterior odds of differential expression)."""
+    var_prior_lim = np.asarray(stdev_coef_lim, dtype=float) ** 2 / np.median(np.atleast_1d(s2_prior))
+    var_prior = np.array([_tmixture_vector(t[:, j], stdev_unscaled[:, j], df_total, proportion, var_prior_lim)
+                          for j in range(t.shape[1])])
+    if np.isnan(var_prior).any():
+        warnings.warn("Estimation of var.prior failed - set to default value")
+        var_prior[np.isnan(var_prior)] = 1 / np.median(np.atleast_1d(s2_prior))
+    r = (stdev_unscaled ** 2 + var_prior[None, :]) / stdev_unscaled ** 2
+    t2 = t ** 2
+    dft = np.broadcast_to(np.asarray(df_total, dtype=float)[:, None], t.shape)
+    inf_df = np.broadcast_to(np.atleast_1d(np.asarray(df_prior, dtype=float) > 1e6)[:, None] if np.ndim(df_prior)
+                             else np.full((t.shape[0], 1), float(df_prior) > 1e6), t.shape)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        kernel = np.where(inf_df, t2 * (1 - 1 / r) / 2, (1 + dft) / 2 * np.log((t2 + dft) / (t2 / r + dft)))
+        lods = np.log(proportion / (1 - proportion)) - np.log(r) / 2 + kernel
+    return var_prior, lods
 
 
 def treat(
@@ -996,6 +1066,7 @@ def treat(
         robust=robust,
         winsor_tail_p=winsor_tail_p,
     )
+    fit.lods = fit.var_prior = None                 # limma's treat reports no B-statistic
     coef = np.asarray(fit.coefficients, dtype=float)
     se = np.asarray(fit.stdev_unscaled, dtype=float) * np.sqrt(fit.s2_post)[:, None]
     acoef = np.abs(coef)
@@ -1095,29 +1166,49 @@ def top_table(
     fit: MArrayLM,
     coef: int | str = 0,
     number: int | float = 10,
-    sort_by: str = "P",
+    sort_by: str = "B",
     adjust_method: str = "BH",
 ) -> pd.DataFrame:
-    """Return a limma-like top table for one coefficient."""
+    """limma ``topTable`` for one coefficient (columns logFC, AveExpr, t, P.Value, adj.P.Val, B).
+
+    ``sort_by`` is ``"B"`` (default, as in limma), ``"P"``, ``"t"``, ``"logFC"`` or ``"none"``.
+    """
 
     if fit.t is None or fit.p_value is None:
         raise ValueError("Run ebayes/eBayes before top_table.")
     coef_i = fit.coef_names.index(coef) if isinstance(coef, str) else int(coef)
     p = fit.p_value[:, coef_i]
-    order = np.argsort(p if sort_by.upper().startswith("P") else -np.abs(fit.t[:, coef_i]))
+    t = fit.t[:, coef_i]
+    b = None if fit.lods is None else fit.lods[:, coef_i]
+    key = sort_by.upper()
+    if key == "B" and b is None:
+        key = "P"                                  # treat fits have no B-statistic
+    if key == "NONE":
+        order = np.arange(p.size)
+    elif key == "B":
+        order = np.argsort(-b, kind="stable")
+    elif key in ("T",):
+        order = np.argsort(-np.abs(t), kind="stable")
+    elif key == "LOGFC":
+        order = np.argsort(-np.abs(fit.coefficients[:, coef_i]), kind="stable")
+    else:
+        order = np.argsort(p, kind="stable")
     if np.isfinite(number):
         order = order[: int(number)]
-    adj = _p_adjust_bh(p) if adjust_method.upper() == "BH" else p
-    return pd.DataFrame(
+    adj = _p_adjust(p, adjust_method)
+    out = pd.DataFrame(
         {
             "gene": np.asarray(fit.gene_names)[order],
             "logFC": fit.coefficients[order, coef_i],
             "AveExpr": fit.Amean[order],
-            "t": fit.t[order, coef_i],
+            "t": t[order],
             "P.Value": p[order],
             "adj.P.Val": adj[order],
         }
     )
+    if b is not None:
+        out["B"] = b[order]
+    return out
 
 
 def _classify_tests_f_stat(tstat: np.ndarray, cov_coefficients: np.ndarray | None = None) -> tuple[np.ndarray, int]:

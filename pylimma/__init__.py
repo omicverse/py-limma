@@ -6,6 +6,8 @@ DEqMS and many expression analyses: ``voom -> lmFit -> contrasts.fit
 -> eBayes -> topTable``.
 """
 
+__version__ = "0.1.1"   # keep in sync with pyproject.toml
+
 from .fit import (
     DuplicateCorrelation,
     EList,

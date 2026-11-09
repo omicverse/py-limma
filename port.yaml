@@ -11,24 +11,24 @@ domain: bulk   # single-cell | spatial | trajectory | bulk | proteomics | metabo
 upstream:
   name: "limma"
   source: "Bioconductor"   # CRAN | Bioconductor | GitHub | other
-  version: null   # TODO: upstream version the parity test was run against
+  version: "3.68.5"
   url: "https://bioconductor.org/packages/limma"
-  license: null   # TODO: upstream R package license (GPL-3, MIT, Artistic-2.0, …)
+  license: "GPL (>=2)"
   citation: "Ritchie, M.E., Phipson, B., Wu, D., Hu, Y., Law, C.W., Shi, W., Smyth, G.K. limma powers differential expression analyses for RNA-sequencing and microarray studies. Nucleic Acids Research 43(7), e47 (2015)."
 omicverse:
-  module: null   # TODO: e.g. ov.single.pyDoubletFinder, or leave null
+  module: "ov.bulk.pyDEG (method='limma'); vendored as omicverse.external.pylimma"
   since: null
 parity:
-  status: unverified   # pass | partial | unverified
-  algorithm_class: null   # TODO: see omicverse-rebuildr/PARITY_TAXONOMY.md
-  metric: null   # TODO: pearson | spearman | ari | jaccard | max_abs_diff | …
-  threshold: null
-  value: null   # TODO: measured value on the canonical fixture
-  fixture: null
-  test: null
+  status: pass   # pass | partial | unverified
+  algorithm_class: statistical-inference
+  metric: "DE-call agreement (FDR<=0.05, |log2FC|>=1) and max relative P-value difference"
+  threshold: "identical DE calls; P rel. diff <= 1e-3"
+  value: "0 discordant calls (eBayes, treat) in 68 analyses; max rel. P diff 1.6e-4 (eBayes), 1.1e-4 (treat)"
+  fixture: "TCGA tumour vs normal: BRCA, COAD, KIRC, LIHC, LUAD, LUSC, PRAD, THCA (421-1,208 samples) + 60 LUAD small-sample draws"
+  test: "tests/test_r_parity.py"
 artifacts:
   audit: null
-  report: null
+  report: "https://omicverse.org/articles/pylimma.html"   # benchmark: report/
   compare_notebook: null
   function_notebook: null
 functions:
@@ -65,6 +65,6 @@ functions:
     py: "remove_batch_effect"
     aliases: ["removeBatchEffect"]
     status: ported
-  - r: "the corresponding S4 classes"
+  - r: "MArrayLM / EList / TestResults (S4 classes)"
     py: "MArrayLM / EList / TestResults"
     status: ported

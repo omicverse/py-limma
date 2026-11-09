@@ -35,10 +35,14 @@ res.head()
 
 ```python
 import pylimma
-v = pylimma.voom(counts, design)            # EList: mean-variance weights
-fit = pylimma.eBayes(pylimma.lmFit(v.E, design, weights=v.weights))
-pylimma.topTable(fit, coef=1)
+v = pylimma.voom(counts, design, lib_size=lib_size)   # EList: logCPM + mean-variance weights
+fit = pylimma.eBayes(pylimma.lmFit(v, design))        # as lmFit(v, design) in R
+pylimma.topTable(fit, coef=1)                         # logFC, AveExpr, t, P.Value, adj.P.Val, B
 ```
+
+`lib_size` is the effective library size (library size x TMM factor), e.g. from
+[pyedger](https://github.com/omicverse/py-edgeR): `pyedger.effective_lib_sizes(pyedger.normLibSizes(dge))`.
+Coefficients are 0-based (`coef=1` is R's `coef = 2`).
 
 ## API
 
